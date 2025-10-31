@@ -1,10 +1,11 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { ChatOpenAI } from '@langchain/openai';
-import { initializeVectorStore, createRetriever } from '@/lib/services';
-import { getEmbeddingConfig, getPineconeConfig } from '@/lib/config';
+import { initializeVectorStore, createRetriever, similaritySearchWithScore } from '@/lib/services';
+import { getEmbeddingConfig, getPineconeConfig, getRetrievalConfig, getCacheConfig } from '@/lib/config';
 import { ChatPromptTemplate } from '@langchain/core/prompts';
 import { StringOutputParser } from '@langchain/core/output_parsers';
 import { RunnableSequence, RunnablePassthrough } from '@langchain/core/runnables';
+import { queryCache, optimizeContext } from '@/lib/utils';
 
 interface ChatMessage {
   role: 'user' | 'assistant';
@@ -28,6 +29,12 @@ interface ChatResponse {
   answer?: string;
   sources?: SourceInfo[];
   message?: string;
+  cached?: boolean;
+  debug?: {
+    docsRetrieved: number;
+    docsAfterFiltering: number;
+    avgScore?: number;
+  };
 }
 
 /**
@@ -51,52 +58,139 @@ export async function POST(request: NextRequest) {
     // Get configuration
     const embeddingConfig = getEmbeddingConfig();
     const pineconeConfig = getPineconeConfig();
+    const retrievalConfig = getRetrievalConfig();
+    const cacheConfig = getCacheConfig();
 
-    // Initialize vector store and retriever
+    // Check cache first if enabled
+    if (cacheConfig.enabled) {
+      const cacheKey = `query:${body.question}:k=${body.k || 8}:filter=${JSON.stringify(body.filter || {})}`;
+      const cachedResult = queryCache.get(cacheKey);
+
+      if (cachedResult) {
+        console.log('✅ Cache HIT - returning cached result');
+        return NextResponse.json({ ...cachedResult, cached: true }, { status: 200 });
+      }
+      console.log('❌ Cache MISS - processing query');
+    }
+
+    // Initialize vector store
     const vectorStore = await initializeVectorStore(embeddingConfig, pineconeConfig);
-    const retriever = createRetriever(vectorStore, {
-      k: body.k || 5,
-      filter: body.filter,
+
+    // Retrieve relevant documents with scores using MMR if enabled
+    console.log('🔍 Retrieving relevant documents...');
+    const k = body.k || 8;
+    
+    let relevantDocs: [any, number][];
+    let docsWithScores: [any, number][];
+    
+    if (retrievalConfig.useMMR) {
+      console.log(`🎯 Using MMR (fetchK=${retrievalConfig.mmrFetchK}, lambda=${retrievalConfig.mmrLambda})`);
+      const retriever = createRetriever(vectorStore, {
+        k,
+        filter: body.filter,
+        searchType: 'mmr',
+        searchKwargs: {
+          fetchK: retrievalConfig.mmrFetchK,
+          lambda: retrievalConfig.mmrLambda,
+        },
+      });
+      
+      // For MMR, we need to get docs and then score them separately
+      const docs = await retriever.invoke(body.question);
+      
+      // Get scores for the MMR results
+      docsWithScores = await similaritySearchWithScore(
+        vectorStore,
+        body.question,
+        k * 2, // Get more to find our MMR results
+        body.filter
+      );
+      
+      // Match MMR docs with their scores
+      relevantDocs = docs.map(doc => {
+        const match = docsWithScores.find(([d]: [any, number]) => d.pageContent === doc.pageContent);
+        return match ? match : [doc, 0.5] as [any, number]; // Default score if not found
+      });
+    } else {
+      // Use regular similarity search with scores
+      docsWithScores = await similaritySearchWithScore(
+        vectorStore,
+        body.question,
+        k,
+        body.filter
+      );
+      relevantDocs = docsWithScores;
+    }
+
+    const initialDocCount = relevantDocs.length;
+    console.log(`✓ Retrieved ${initialDocCount} documents`);
+
+    // Filter by similarity threshold
+    const filteredDocs = relevantDocs.filter(([doc, score]) => {
+      const meetsThreshold = score >= retrievalConfig.similarityThreshold;
+      if (meetsThreshold) {
+        console.log(`  ✓ ${doc.metadata.title} (score: ${score.toFixed(3)})`);
+      }
+      return meetsThreshold;
     });
+
+    // If no documents meet threshold, try with fallback
+    let finalDocs = filteredDocs;
+    if (filteredDocs.length === 0 && relevantDocs.length > 0) {
+      console.log(`⚠️  No docs meet threshold ${retrievalConfig.similarityThreshold}, trying fallback ${retrievalConfig.fallbackThreshold}`);
+      finalDocs = relevantDocs.filter(([doc, score]) => score >= retrievalConfig.fallbackThreshold);
+    }
+
+    // Extract just the documents (without scores)
+    const docsOnly = finalDocs.map(([doc]) => doc);
+    const avgScore = finalDocs.length > 0 
+      ? finalDocs.reduce((sum, [, score]) => sum + score, 0) / finalDocs.length 
+      : 0;
+
+    console.log(`✓ After filtering: ${docsOnly.length} relevant documents (avg score: ${avgScore.toFixed(3)})`);
 
     // Initialize LLM with low temperature for factual responses
     const llm = new ChatOpenAI({
       modelName: 'gpt-4o-mini',
-      temperature: 0.3, // Lower temperature to reduce hallucination and stick to facts
+      temperature: 0.2, // Very low temperature to stick to facts
       apiKey: embeddingConfig.apiKey,
     });
 
-    // Retrieve relevant documents
-    console.log('🔍 Retrieving relevant documents...');
-    const relevantDocs = await retriever.invoke(body.question);
-    console.log(`✓ Found ${relevantDocs.length} relevant documents`);
-
     // Check if we have any relevant context
-    if (relevantDocs.length === 0) {
+    if (docsOnly.length === 0) {
       console.log('⚠️  No relevant documents found in knowledge base');
       return NextResponse.json(
         {
           success: true,
           answer: "I couldn't find any relevant information in the knowledge base to answer your question. Please make sure the relevant content has been added first.",
           sources: [],
+          debug: {
+            docsRetrieved: initialDocCount,
+            docsAfterFiltering: 0,
+            avgScore: 0,
+          },
         },
         { status: 200 }
       );
     }
 
-    // Format context from documents
-    const context = relevantDocs
-      .map((doc) => doc.pageContent)
-      .join('\n\n---\n\n');
+    // Optimize context - extract only relevant portions
+    console.log('📝 Optimizing context...');
+    const context = optimizeContext(docsOnly, body.question, retrievalConfig.maxContextTokens);
 
     // Check if context is meaningful
     if (!context.trim()) {
-      console.log('⚠️  Empty context from documents');
+      console.log('⚠️  Empty context after optimization');
       return NextResponse.json(
         {
           success: true,
           answer: "The retrieved documents don't contain sufficient information to answer your question. Please add more detailed content to the knowledge base.",
           sources: [],
+          debug: {
+            docsRetrieved: initialDocCount,
+            docsAfterFiltering: docsOnly.length,
+            avgScore,
+          },
         },
         { status: 200 }
       );
@@ -111,18 +205,22 @@ export async function POST(request: NextRequest) {
         recentHistory.map(msg => `${msg.role === 'user' ? 'User' : 'Assistant'}: ${msg.content}`).join('\n');
     }
 
-    // Create prompt template - STRICTLY LIMITED TO KNOWLEDGE BASE ONLY with chat context
+    // Create enhanced prompt with chain-of-thought reasoning
     const prompt = ChatPromptTemplate.fromTemplate(
       `You are the Foodhub Knowledge Base Assistant. You provide helpful, conversational answers using ONLY the knowledge base context provided.
 
 CRITICAL RULES:
 1. ONLY use information from the Knowledge Base Context below
-2. DO NOT use external knowledge or make assumptions
-3. Be conversational and natural in your responses
-4. If you need to reference previous conversation, use the chat history
-5. If the answer is not in the context, say "I don't have that information in the knowledge base"
-6. Provide clear, well-structured answers
-7. Be concise but thorough
+2. DO NOT use external knowledge, assumptions, or information not in the context
+3. First, think step-by-step internally (don't show this reasoning to the user):
+   - What is the user asking?
+   - What relevant information is in the context?
+   - How can I best answer using only this information?
+4. Then provide a clear, conversational response
+5. If you need to reference previous conversation, use the chat history
+6. If the answer is not in the context, explicitly say "I don't have that information in the knowledge base"
+7. Be concise but thorough - focus on what matters most
+8. Use natural language and maintain Foodhub's professional yet friendly tone
 
 Knowledge Base Context:
 {context}
@@ -130,7 +228,7 @@ Knowledge Base Context:
 
 Current Question: {question}
 
-Provide a helpful answer based ONLY on the knowledge base context above:`
+Think through the question, then provide your answer based ONLY on the knowledge base context above:`
     );
 
     // Create RAG chain
@@ -153,7 +251,7 @@ Provide a helpful answer based ONLY on the knowledge base context above:`
 
     // Extract unique sources with clean metadata
     const uniqueSourcesMap = new Map<string, SourceInfo>();
-    relevantDocs.forEach((doc) => {
+    docsOnly.forEach((doc) => {
       const url = doc.metadata.source_url;
       if (url && !uniqueSourcesMap.has(url)) {
         uniqueSourcesMap.set(url, {
@@ -169,7 +267,19 @@ Provide a helpful answer based ONLY on the knowledge base context above:`
       success: true,
       answer: answer,
       sources: cleanSources,
+      debug: {
+        docsRetrieved: initialDocCount,
+        docsAfterFiltering: docsOnly.length,
+        avgScore,
+      },
     };
+
+    // Cache the response if caching is enabled
+    if (cacheConfig.enabled) {
+      const cacheKey = `query:${body.question}:k=${body.k || 8}:filter=${JSON.stringify(body.filter || {})}`;
+      queryCache.set(cacheKey, response, cacheConfig.ttl);
+      console.log(`💾 Cached response (TTL: ${cacheConfig.ttl}ms)`);
+    }
 
     return NextResponse.json(response, { status: 200 });
 

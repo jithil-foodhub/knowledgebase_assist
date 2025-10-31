@@ -43,3 +43,28 @@ export function getChunkConfig() {
   };
 }
 
+/**
+ * Get retrieval configuration
+ */
+export function getRetrievalConfig() {
+  return {
+    similarityThreshold: parseFloat(process.env.SIMILARITY_THRESHOLD || '0.7'),
+    fallbackThreshold: parseFloat(process.env.FALLBACK_THRESHOLD || '0.5'),
+    useMMR: process.env.USE_MMR === 'true',
+    mmrFetchK: parseInt(process.env.MMR_FETCH_K || '20'),
+    mmrLambda: parseFloat(process.env.MMR_LAMBDA || '0.5'),
+    maxContextTokens: parseInt(process.env.MAX_CONTEXT_TOKENS || '2000'),
+  };
+}
+
+/**
+ * Get cache configuration
+ */
+export function getCacheConfig() {
+  return {
+    enabled: process.env.CACHE_ENABLED !== 'false', // Enabled by default
+    ttl: parseInt(process.env.QUERY_CACHE_TTL || '300000'), // 5 minutes
+    maxSize: parseInt(process.env.QUERY_CACHE_SIZE || '50'),
+  };
+}
+

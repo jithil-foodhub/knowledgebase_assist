@@ -1,5 +1,6 @@
 import { RecursiveCharacterTextSplitter } from '@langchain/textsplitters';
 import { Document } from '@langchain/core/documents';
+import { extractKeywords } from './text-processing';
 
 export interface ChunkOptions {
   maxTokens?: number;
@@ -32,8 +33,25 @@ export async function chunkText(
   const textSplitter = new RecursiveCharacterTextSplitter({
     chunkSize,
     chunkOverlap,
-    separators: ['\n\n', '\n', '. ', '! ', '? ', '; ', ', ', ' ', ''], // Try these in order
-    keepSeparator: false,
+    // Better separators that respect document structure
+    separators: [
+      '\n\n\n',      // Multiple blank lines (section breaks)
+      '\n\n',        // Paragraph breaks
+      '\n',          // Single line breaks
+      '. ',          // Sentence endings
+      '! ',
+      '? ',
+      '; ',          // Semicolons
+      ': ',          // Colons (for lists)
+      ', ',          // Commas
+      ' ',           // Spaces
+      '',            // Characters (last resort)
+    ],
+    keepSeparator: true,  // Keep separators for better context
+    lengthFunction: (text: string) => {
+      // More accurate token counting (rough: 1 token ≈ 4 chars for English)
+      return Math.ceil(text.length / 4);
+    },
   });
 
   // Create documents with metadata
@@ -41,11 +59,31 @@ export async function chunkText(
 
   console.log(`✓ Created ${docs.length} chunks`);
   
-  // Add chunk index to metadata
+  // Add enhanced metadata to each chunk
   docs.forEach((doc: Document, index: number) => {
     doc.metadata.chunk_index = index;
+    doc.metadata.chunk_total = docs.length;
     doc.metadata.char_count = doc.pageContent.length;
+    doc.metadata.word_count = doc.pageContent.split(/\s+/).length;
     doc.metadata.updated_at = new Date().toISOString();
+    
+    // Extract first sentence as preview
+    const firstSentence = doc.pageContent.split(/[.!?]/)[0]?.trim();
+    doc.metadata.preview = firstSentence ? firstSentence.substring(0, 150) : '';
+    
+    // Calculate position in document (beginning, middle, end)
+    const position = index / docs.length;
+    if (position < 0.33) {
+      doc.metadata.position = 'beginning';
+    } else if (position > 0.66) {
+      doc.metadata.position = 'end';
+    } else {
+      doc.metadata.position = 'middle';
+    }
+    
+    // Extract key phrases (simple keyword extraction)
+    const keywords = extractKeywords(doc.pageContent, 5);
+    doc.metadata.keywords = keywords.join(', ');
   });
 
   return docs;

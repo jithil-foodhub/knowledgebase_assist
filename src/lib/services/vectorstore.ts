@@ -75,7 +75,7 @@ export async function similaritySearchWithScore(
 }
 
 /**
- * Create a retriever for RAG chains
+ * Create a retriever for RAG chains with advanced options
  */
 export function createRetriever(
   vectorStore: PineconeStore,
@@ -83,13 +83,31 @@ export function createRetriever(
     k?: number;
     filter?: Record<string, any>;
     searchType?: 'similarity' | 'mmr';
+    searchKwargs?: {
+      fetchK?: number;  // Number of candidates to fetch for MMR
+      lambda?: number;   // MMR diversity parameter (0-1)
+    };
   }
 ) {
-  return vectorStore.asRetriever({
-    k: options?.k || 5,
+  const searchType = options?.searchType || 'similarity';
+  const k = options?.k || 5;
+  
+  // Configure search parameters
+  const retrieverConfig: any = {
+    k,
     filter: options?.filter,
-    searchType: options?.searchType || 'similarity',
-  });
+    searchType,
+  };
+  
+  // Add MMR-specific parameters if using MMR
+  if (searchType === 'mmr' && options?.searchKwargs) {
+    retrieverConfig.searchKwargs = {
+      fetchK: options.searchKwargs.fetchK || k * 4, // Fetch 4x candidates by default
+      lambda: options.searchKwargs.lambda ?? 0.5,   // Default: balanced relevance/diversity
+    };
+  }
+  
+  return vectorStore.asRetriever(retrieverConfig);
 }
 
 /**
