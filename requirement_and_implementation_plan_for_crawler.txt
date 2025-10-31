@@ -1,0 +1,208 @@
+Requirement and Implementation Plan for Crawler
+===============================================
+
+Project: Knowledge-Base Ingestion & Semantic Search (Crawler-focused)
+Target quick-deploy stack: Next.js (TypeScript), Node.js, AWS (Lambda/EC2/ECS), DynamoDB, Redis, Vector DB (Weaviate / Pinecone / self-hostable), OpenRouter/Gemini/OpenAI for embeddings & LLMs, LangChain (or langchain-like orchestration).
+
+GOAL
+----
+Build a minimal, deployable today MVP that:
+- Crawls a given knowledge-base URL (or set of URLs).
+- Extracts and cleans text, splits into chunks, generates embeddings, and stores vectors + metadata in a vector DB.
+- Provides a Next.js-based API endpoint to query the knowledge base via semantic search.
+- Supports semantic caching (Redis) to reduce repeated embedding/LLM calls.
+- Integrates with DynamoDB for conversation/session memory.
+
+REQUIREMENTS (functional)
+-------------------------
+1. URL Ingestion
+   - Input: single URL or a list of KB URLs
+   - Output: extracted plain text, title, canonical URL, last-modified if available
+
+2. Content Processing / Chunking
+   - Clean HTML -> text (remove navigation, scripts, footer noise)
+   - Chunking: 500–800 tokens per chunk (approx 300–600 words) with 20% overlap
+   - Each chunk should carry metadata: source_url, title, chunk_index, char_count, section_heading (if available)
+
+3. Embeddings & Vector Storage
+   - Use an embeddings provider (OpenRouter -> chosen model, or OpenAI/Gemini)
+   - Store embedding vector + metadata + original snippet in vector DB
+   - Deduplicate similarly identical chunks (hash content check)
+
+4. Querying
+   - Convert user query -> embedding
+   - Search top-K similar chunks from vector DB (K default 5)
+   - Optionally run a small LLM prompt to synthesize final concise answer from retrieved chunks
+   - Include provenance: top matched URLs/snippets in response
+
+5. Semantic Cache
+   - Use Redis to store (query-vector-hash -> answer + metadata)
+   - When new query arrives: compute its embedding and check nearby cached vectors for similarity (threshold)
+   - If match found return cached answer
+
+6. Session Memory
+   - Store conversation sessions in DynamoDB as separate items (sessionId as PK)
+   - Each session contains array of message objects; when resuming load last N messages (e.g., 10)
+
+7. Crawling Update Strategy
+   - Manual trigger via API or dashboard to re-crawl a URL
+   - Scheduled re-crawl for frequently-changing pages (cron, EventBridge)
+   - On update detect: re-chunk and upsert vector records
+
+NON-FUNCTIONAL REQUIREMENTS
+---------------------------
+- Deployable in a single day as MVP
+- Cost-efficient: prefer small instance / serverless + managed vector DB free-tier or self-hosted lightweight option
+- Low latency: target sub-second vector DB lookup; LLM synthesis within a couple of seconds
+- Scalability: up to 10k documents initially; plan for sharding / autoscale later
+
+TECH STACK RECOMMENDATIONS
+--------------------------
+- Frontend & API: Next.js (TypeScript) — API routes will handle query and admin endpoints
+- Crawler: Node.js with Cheerio + axios (or Playwright if JS-rendered pages required)
+- Embeddings & LLM: OpenRouter/Gemini or OpenAI (choose OpenRouter for routing / cost control)
+- Vector DB:
+  - Option A: Pinecone — simplest managed service, good docs
+  - Option B: Weaviate — open-source and can be self-hosted (cost control)
+  - Option C: Self-hosted FAISS via Milvus — more infra work
+- Orchestration: LangChain (JS) or a small custom orchestrator if you want minimal dependencies
+- Cache: Redis (AWS ElastiCache or Redis on small EC2)
+- Session store: DynamoDB (single table: sessionId PK)
+- Deployment: Vercel (Next.js) + AWS Lambda or small ECS for background crawler jobs OR run everything on an EC2 for fastest one-day setup
+
+DATA MODELS (examples)
+----------------------
+Vector DB entry (each chunk):
+{
+  id: "<uuid>",
+  embedding: [float...],
+  text_snippet: "the chunk text...",
+  source_url: "https://kb.company/page",
+  title: "Page Title",
+  chunk_index: 0,
+  updated_at: "2025-10-29T12:00:00Z",
+  metadata: { section: "Pricing", author: "...", tags: [...] }
+}
+
+DynamoDB session item:
+PK: session#<sessionId>
+{
+  sessionId: "<sessionId>",
+  userId: "<userId>",
+  createdAt: "...",
+  lastUpdatedAt: "...",
+  messages: [
+    { role: "agent", text: "...", ts: "..." },
+    { role: "assistant", text: "...", ts: "..." }
+  ]
+}
+
+IMPLEMENTATION PLAN (step-by-step; deployable same day)
+-------------------------------------------------------
+Phase 0 — Scaffolding (30–60 mins)
+- Create Next.js TypeScript app
+- Setup environment variables and config (VECTOR_DB_URL, EMBEDDING_API_KEY, REDIS_URL, DYNAMO_TABLE, etc.)
+- Add an /admin page with simple form for URL ingestion (one URL input, submit)
+
+Phase 1 — Crawler + Ingest Prototype (60–90 mins)
+- Implement a simple crawler module:
+  - fetchHtml(url) using axios
+  - parseHtmlWithCheerio(html) -> extract <article> or main content heuristics (fallback to body text)
+  - cleanText() -> normalize whitespace, remove boilerplate
+- Implement chunkText(text, maxTokensApprox=600, overlapPercent=20) -> returns array of chunks with indexes
+- Hook embedding provider:
+  - makeEmbed(text) -> returns embedding vector
+  - choose batching (embed per chunk, batch size 8–16)
+- Upsert vectors to chosen vector DB (start with Pinecone or Weaviate for speed)
+- Return ingestion status in API response
+
+Phase 2 — Query API + Frontend (45–90 mins)
+- API route: POST /api/query { sessionId?, query, topK? }
+  - compute embedding for query
+  - check semantic cache (Redis): find cached vectors with cosine similarity above t (e.g., 0.88)
+    - if cache hit return cached answer
+  - else: vectorDB.query(embedding, topK)
+  - retrieve snippets and metadata
+  - synthesize concise answer using LLM (short prompt + retrieved snippets) — or simple concatenation + trimming if you want cheaper
+  - save final Q/A to DynamoDB session
+  - store answer in Redis cache with embedding key
+- Frontend chat UI:
+  - simple input box, message list; call /api/query; show answer + provenance links
+
+Phase 3 — Add session management + resume logic (30 mins)
+- Create session create/load endpoints: GET /api/session/:id and POST /api/session
+- When loading session, send last N messages to AI for context (N configurable)
+
+Phase 4 — Scheduling & Re-crawl (30 mins)
+- Add admin endpoints to re-crawl URL
+- Optionally add a cron (AWS EventBridge -> Lambda job) to re-crawl frequently updated pages
+
+Phase 5 — Semantic Cache tuning & cost controls (ongoing)
+- Choose cache TTL (e.g., 24h) for entries that come from KB
+- When cost matters, avoid calling LLM for simple direct answer extraction (if snippet directly answers question, return it)
+- Monitor embedding calls and batch them during ingest to reduce per-call overhead
+
+CHUNKING & PROMPT STRATEGY (cost control)
+-----------------------------------------
+- Chunk smaller for more precise matches (500–800 tokens).
+- For LLM prompt: keep the instruction short, supply only selected top-3 snippets.
+- Use "concise answer + show source links" as the prompt recipe to reduce token cost.
+- Consider using cheaper models for embeddings (if OpenRouter exposes cheaper models) and reserve higher-quality models for final synthesis only when needed.
+
+SEMANTIC CACHE ALGORITHM (simple)
+---------------------------------
+1. Compute query embedding.
+2. Query Redis for stored cache entries (store cache keys with embedding + text).
+   - Option A: Use Redis vector search module (RedisSearch/RedisStack) to store and search embeddings directly.
+   - Option B: Keep a small in-memory shortlist of popular embeddings (for MVP).
+3. If top similarity >= threshold, return cached answer.
+4. Else proceed to vector DB and LLM, then cache the response.
+
+OPERATIONAL & COST NOTES
+------------------------
+- Pinecone: easy to integrate, paid after free tier. Good for a quick MVP.
+- Weaviate: free self-hostable, but requires more infra (can run small instance in ECS/EC2).
+- FAISS/Milvus: heavier but cheap if self-hosted (requires infra management).
+- Embeddings calls: dominating cost — batch embeddings, reuse embeddings where possible.
+- Caching: Redis can dramatically cut costs for repeated queries.
+- DynamoDB: cost is minimal with low throughput for session storage; use on-demand capacity for simplicity.
+
+SAMPLE API ENDPOINTS
+--------------------
+POST /api/admin/ingest
+  Body: { url: "https://kb/... ", sourceName?: "KB v1", reindex?: false }
+
+POST /api/query
+  Body: { sessionId?: "...", query: "...", topK?: 5 }
+
+POST /api/session
+  Body: { userId: "...", title?: "Support case #123" } -> returns sessionId
+
+GET /api/session/:id
+  Returns last N messages + meta
+
+IMPLEMENTATION TASK LIST (for a single developer; MVP in 1 day)
+----------------------------------------------------------------
+1. Initialize Next.js TypeScript project + environment config
+2. Implement crawler (axios + cheerio) + chunker
+3. Integrate embedding provider (OpenRouter/OpenAI) and vector DB (Pinecone)
+4. Implement /api/admin/ingest and store vectors
+5. Implement /api/query with Redis semantic cache and LLM synthesis
+6. Implement simple chat UI page + session endpoints (DynamoDB)
+7. Deploy to Vercel for front-end / API; run ingestion worker on small EC2 or serverless function
+8. Test with sample KB URLs, tune chunk sizes, topK, and cache thresholds
+
+FUTURE IMPROVEMENTS
+-------------------
+- Add incremental diffing: detect changed content and only re-index deltas
+- Add role-based prompt templates (agent persona, tone, brevity)
+- Add analytics: top queries, uncached queries, KB pages with low coverage
+- Add feedback loop to improve answers (agent marks helpfulness -> store labels)
+
+QUICK NOTES & TIPS
+------------------
+- Keep provenance visible (URLs & snippet highlights) — agents must see source.
+- For immediate day deploy: Pinecone + OpenRouter + Redis (small) + DynamoDB is fastest.
+- If you want zero managed costs later: host Weaviate + Milvus on a tiny EC2 cluster, but initial time to set up will be higher.
+
+--- End of document ---
